@@ -64,6 +64,9 @@ public:
     bool Initialize(const WifiManagerConfig& config = WifiManagerConfig{});
     bool IsInitialized() const;
 
+    /// STA 或配置 AP 是否正在运行（用于状态上报：与「WiFi 已开启」语义对齐）
+    bool IsWifiSessionActive() const;
+
     // ==================== Station Mode ====================
     
     void StartStation();   // Non-blocking, auto-stops config AP if active

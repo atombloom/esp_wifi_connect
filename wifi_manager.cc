@@ -106,6 +106,11 @@ bool WifiManager::IsInitialized() const {
     return initialized_;
 }
 
+bool WifiManager::IsWifiSessionActive() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return station_active_ || config_mode_active_;
+}
+
 // ==================== Station Mode ====================
 
 void WifiManager::StartStation() {
