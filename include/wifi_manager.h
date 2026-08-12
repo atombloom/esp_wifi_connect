@@ -26,6 +26,7 @@
 #include <memory>
 #include <functional>
 #include <mutex>
+#include <vector>
 
 #include "wifi_station.h"
 
@@ -38,6 +39,8 @@ enum class WifiEvent {
     Connecting,        // Connecting to network (call GetSsid() for target)
     Connected,         // Successfully connected
     Disconnected,      // Disconnected from network
+    ScanCompleted,     // Access-point list is ready
+    ConnectionFailed,  // A direct connection exhausted its retries
     ConfigModeEnter,   // Entered config AP mode
     ConfigModeExit,    // Exited config AP mode
 };
@@ -87,6 +90,8 @@ public:
                                      const std::string& password,
                                      bool enable_scan = true);
     void StopStation();    // Non-blocking
+    bool ScanAccessPoints();
+    std::vector<WifiAccessPoint> GetAccessPoints() const;
     
     bool IsConnected() const;
     std::string GetSsid() const;
@@ -121,6 +126,7 @@ private:
     WifiManager();
     ~WifiManager();
 
+    void ConfigureStationCallbacks();
     void NotifyEvent(WifiEvent event);
 
     WifiManagerConfig config_;

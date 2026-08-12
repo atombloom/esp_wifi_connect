@@ -3,6 +3,7 @@
 
 #include <string>
 #include <vector>
+#include <mutex>
 
 struct SsidItem {
     std::string ssid;
@@ -20,7 +21,7 @@ public:
     void RemoveSsid(int index);
     void SetDefaultSsid(int index);
     void Clear();
-    const std::vector<SsidItem>& GetSsidList() const { return ssid_list_; }
+    std::vector<SsidItem> GetSsidList() const;
 
 private:
     SsidManager();
@@ -29,6 +30,7 @@ private:
     void LoadFromNvs();
     void SaveToNvs();
 
+    mutable std::mutex mutex_;
     std::vector<SsidItem> ssid_list_;
 };
 

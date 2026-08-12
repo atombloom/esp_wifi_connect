@@ -51,7 +51,6 @@ bool WifiManager::Initialize(const WifiManagerConfig& config) {
     std::lock_guard<std::mutex> lock(mutex_);
     
     if (initialized_) {
-        ESP_LOGW(TAG, "Already initialized");
         return true;
     }
 
@@ -143,19 +142,7 @@ void WifiManager::StartStation() {
     station_->SetScanIntervalRange(config_.station_scan_min_interval_seconds,
                                    config_.station_scan_max_interval_seconds);
 
-    // Setup callbacks
-    station_->OnScanBegin([this]() {
-        NotifyEvent(WifiEvent::Scanning);
-    });
-    station_->OnConnect([this](const std::string&) {
-        NotifyEvent(WifiEvent::Connecting);
-    });
-    station_->OnConnected([this](const std::string&) {
-        NotifyEvent(WifiEvent::Connected);
-    });
-    station_->OnDisconnected([this]() {
-        NotifyEvent(WifiEvent::Disconnected);
-    });
+    ConfigureStationCallbacks();
 
     station_->Start();
     station_active_ = true;
@@ -195,22 +182,10 @@ void WifiManager::StartStationWithCredentials(const std::string& ssid,
     station_->SetScanIntervalRange(config_.station_scan_min_interval_seconds,
                                    config_.station_scan_max_interval_seconds);
 
-    // Setup callbacks
-    station_->OnScanBegin([this]() {
-        NotifyEvent(WifiEvent::Scanning);
-    });
-    station_->OnConnect([this](const std::string&) {
-        NotifyEvent(WifiEvent::Connecting);
-    });
-    station_->OnConnected([this](const std::string&) {
-        NotifyEvent(WifiEvent::Connected);
-    });
-    station_->OnDisconnected([this]() {
-        NotifyEvent(WifiEvent::Disconnected);
-    });
+    ConfigureStationCallbacks();
 
     if (enable_scan) {
-        // 保持原有行为：使用扫描 + SsidManager 选择可用 AP
+        // Start() first tries the most recently used saved credential, then scans on failure.
         station_->Start();
     } else {
         // 直连模式：不主动扫描，直接使用 BLUFI / 调用方提供的 SSID/密码进行连接
@@ -232,10 +207,24 @@ void WifiManager::StopStation() {
     station_->Stop();
     ESP_LOGI(TAG, "Station stopped");
     station_active_ = false;
-    
+}
+
+bool WifiManager::ScanAccessPoints() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!initialized_ || !station_active_ || !station_) {
+        return false;
+    }
+    const bool started = station_->ScanAccessPoints();
     lock.unlock();
-    NotifyEvent(WifiEvent::Disconnected);
-    lock.lock();
+    if (started) {
+        NotifyEvent(WifiEvent::Scanning);
+    }
+    return started;
+}
+
+std::vector<WifiAccessPoint> WifiManager::GetAccessPoints() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return station_ ? station_->GetAccessPoints() : std::vector<WifiAccessPoint>{};
 }
 
 bool WifiManager::IsConnected() const {
@@ -372,6 +361,27 @@ void WifiManager::SetPowerSaveLevel(WifiPowerSaveLevel level) {
 }
 
 // ==================== Event ====================
+
+void WifiManager::ConfigureStationCallbacks() {
+    station_->OnScanBegin([this]() {
+        NotifyEvent(WifiEvent::Scanning);
+    });
+    station_->OnScanCompleted([this](const std::vector<WifiAccessPoint>&) {
+        NotifyEvent(WifiEvent::ScanCompleted);
+    });
+    station_->OnConnect([this](const std::string&) {
+        NotifyEvent(WifiEvent::Connecting);
+    });
+    station_->OnConnected([this](const std::string&) {
+        NotifyEvent(WifiEvent::Connected);
+    });
+    station_->OnDisconnected([this]() {
+        NotifyEvent(WifiEvent::Disconnected);
+    });
+    station_->OnConnectionFailed([this]() {
+        NotifyEvent(WifiEvent::ConnectionFailed);
+    });
+}
 
 void WifiManager::SetEventCallback(std::function<void(WifiEvent)> callback) {
     std::lock_guard<std::mutex> lock(mutex_);

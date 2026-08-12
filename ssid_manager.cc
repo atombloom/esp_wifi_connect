@@ -1,6 +1,7 @@
 #include "ssid_manager.h"
 
 #include <algorithm>
+#include <utility>
 #include <esp_log.h>
 #include <nvs_flash.h>
 
@@ -16,8 +17,14 @@ SsidManager::~SsidManager() {
 }
 
 void SsidManager::Clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
     ssid_list_.clear();
     SaveToNvs();
+}
+
+std::vector<SsidItem> SsidManager::GetSsidList() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ssid_list_;
 }
 
 void SsidManager::LoadFromNvs() {
@@ -84,14 +91,17 @@ void SsidManager::SaveToNvs() {
 }
 
 void SsidManager::AddSsid(const std::string& ssid, const std::string& password) {
-    for (auto& item : ssid_list_) {
-        ESP_LOGI(TAG, "compare [%s:%d] [%s:%d]", item.ssid.c_str(), item.ssid.size(), ssid.c_str(), ssid.size());
-        if (item.ssid == ssid) {
-            ESP_LOGW(TAG, "SSID %s already exists, overwrite it", ssid.c_str());
-            item.password = password;
-            SaveToNvs();
-            return;
-        }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto existing = std::find_if(ssid_list_.begin(), ssid_list_.end(), [&ssid](const SsidItem& item) {
+        return item.ssid == ssid;
+    });
+    if (existing != ssid_list_.end()) {
+        existing->password = password;
+        SsidItem updated = *existing;
+        ssid_list_.erase(existing);
+        ssid_list_.insert(ssid_list_.begin(), std::move(updated));
+        SaveToNvs();
+        return;
     }
 
     if (ssid_list_.size() >= MAX_WIFI_SSID_COUNT) {
@@ -104,6 +114,7 @@ void SsidManager::AddSsid(const std::string& ssid, const std::string& password) 
 }
 
 void SsidManager::RemoveSsid(int index) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (index < 0 || index >= ssid_list_.size()) {
         ESP_LOGW(TAG, "Invalid index %d", index);
         return;
@@ -113,6 +124,7 @@ void SsidManager::RemoveSsid(int index) {
 }
 
 void SsidManager::SetDefaultSsid(int index) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (index < 0 || index >= ssid_list_.size()) {
         ESP_LOGW(TAG, "Invalid index %d", index);
         return;

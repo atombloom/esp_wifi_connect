@@ -1,6 +1,7 @@
 #include "wifi_station.h"
 #include <cstring>
 #include <algorithm>
+#include <utility>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
@@ -16,7 +17,7 @@
 #define WIFI_EVENT_CONNECTED BIT0
 #define WIFI_EVENT_STOPPED BIT1
 #define WIFI_EVENT_SCAN_DONE_BIT BIT2
-#define MAX_RECONNECT_COUNT 5
+#define MAX_RECONNECT_COUNT_MANUAL 5
 
 WifiStation::WifiStation() {
     // Create the event group
@@ -25,8 +26,13 @@ WifiStation::WifiStation() {
     // 读取配置
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("wifi", NVS_READONLY, &nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS: %d", err);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        // No saved WiFi credentials yet; defaults are used until the first AddSsid.
+        ESP_LOGI(TAG, "No saved WiFi credentials in NVS");
+        max_tx_power_ = 0;
+        remember_bssid_ = 0;
+    } else if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
         max_tx_power_ = 0;
         remember_bssid_ = 0;
     } else {
@@ -87,6 +93,10 @@ void WifiStation::Stop() {
     
     // Reset was_connected_ flag to prevent stale state from affecting subsequent sessions
     was_connected_ = false;
+    connect_after_scan_.store(false);
+    scan_in_progress_.store(false);
+    immediate_scan_fallback_.store(false);
+    connect_queue_.clear();
 
     // Clear connected bit
     xEventGroupClearBits(event_group_, WIFI_EVENT_CONNECTED);
@@ -98,6 +108,15 @@ void WifiStation::Stop() {
 
 void WifiStation::OnScanBegin(std::function<void()> on_scan_begin) {
     on_scan_begin_ = on_scan_begin;
+}
+
+void WifiStation::OnScanCompleted(
+    std::function<void(const std::vector<WifiAccessPoint>&)> on_scan_completed) {
+    on_scan_completed_ = std::move(on_scan_completed);
+}
+
+void WifiStation::OnConnectionFailed(std::function<void()> on_connection_failed) {
+    on_connection_failed_ = std::move(on_connection_failed);
 }
 
 void WifiStation::OnConnect(std::function<void(const std::string& ssid)> on_connect) {
@@ -113,17 +132,40 @@ void WifiStation::OnDisconnected(std::function<void()> on_disconnected) {
 }
 
 void WifiStation::Start() {
-    // 扫描模式：保留原有行为
-    direct_mode_ = false;
+    const std::vector<SsidItem> saved_networks = SsidManager::GetInstance().GetSsidList();
+    if (!saved_networks.empty()) {
+        // Try the most recently successful network first. This removes the normal scan delay.
+        direct_mode_ = true;
+        scan_fallback_enabled_ = true;
+        immediate_scan_fallback_.store(true);
+        max_reconnect_count_ = 3;
+        ssid_ = saved_networks.front().ssid;
+        password_ = saved_networks.front().password;
+    } else {
+        direct_mode_ = false;
+        scan_fallback_enabled_ = true;
+        immediate_scan_fallback_.store(false);
+    }
     StartInternal();
 }
 
 void WifiStation::StartWithoutScan(const std::string& ssid, const std::string& password) {
-    // 直连模式：不启动扫描定时器，只使用给定的 SSID/密码进行连接
     direct_mode_ = true;
+    scan_fallback_enabled_ = false;
+    immediate_scan_fallback_.store(false);
+    max_reconnect_count_ = MAX_RECONNECT_COUNT_MANUAL;
     ssid_ = ssid;
     password_ = password;
     StartInternal();
+}
+
+bool WifiStation::ScanAccessPoints() {
+    return StartScan(false, false);
+}
+
+std::vector<WifiAccessPoint> WifiStation::GetAccessPoints() const {
+    std::lock_guard<std::mutex> lock(access_points_mutex_);
+    return access_points_;
 }
 
 void WifiStation::StartInternal() {
@@ -154,19 +196,49 @@ void WifiStation::StartInternal() {
         ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(max_tx_power_));
     }
 
-    // 仅在扫描模式下创建扫描定时器；直连模式下完全不触发主动扫描
-    if (!direct_mode_) {
-        esp_timer_create_args_t timer_args = {
-            .callback = [](void* arg) {
-                esp_wifi_scan_start(nullptr, false);
-            },
-            .arg = this,
-            .dispatch_method = ESP_TIMER_TASK,
-            .name = "WiFiScanTimer",
-            .skip_unhandled_events = true
-        };
-        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer_handle_));
+    esp_timer_create_args_t timer_args = {
+        .callback = [](void* arg) {
+            static_cast<WifiStation*>(arg)->StartScan(true, true);
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "WiFiScanTimer",
+        .skip_unhandled_events = true
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer_handle_));
+}
+
+bool WifiStation::StartScan(bool connect_after_scan, bool notify_started) {
+    bool expected = false;
+    if (!scan_in_progress_.compare_exchange_strong(expected, true)) {
+        // Manual refreshes can arrive while an automatic scan is still running.
+        // The in-flight scan will publish the same fresh AP list, so treat this as accepted.
+        return true;
     }
+    connect_after_scan_.store(connect_after_scan);
+    const esp_err_t result = esp_wifi_scan_start(nullptr, false);
+    if (result != ESP_OK) {
+        scan_in_progress_.store(false);
+        connect_after_scan_.store(false);
+        ESP_LOGW(TAG, "Start scan failed: %s", esp_err_to_name(result));
+        return false;
+    }
+    if (notify_started && on_scan_begin_) {
+        on_scan_begin_();
+    }
+    return true;
+}
+
+void WifiStation::ScheduleNextScan() {
+    if (timer_handle_ == nullptr) {
+        return;
+    }
+    const esp_err_t result = esp_timer_start_once(timer_handle_, scan_current_interval_microseconds_);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Schedule scan failed: %s", esp_err_to_name(result));
+        return;
+    }
+    UpdateScanInterval();
 }
 
 bool WifiStation::WaitForConnected(int timeout_ms) {
@@ -178,23 +250,49 @@ bool WifiStation::WaitForConnected(int timeout_ms) {
 }
 
 void WifiStation::HandleScanResult() {
-    // 直连模式下不应进入扫描结果处理，这里防御性返回
-    if (direct_mode_) {
-        return;
-    }
+    scan_in_progress_.store(false);
+    const bool connect_after_scan = connect_after_scan_.exchange(false);
     uint16_t ap_num = 0;
-    esp_wifi_scan_get_ap_num(&ap_num);
-    wifi_ap_record_t *ap_records = (wifi_ap_record_t *)malloc(ap_num * sizeof(wifi_ap_record_t));
-    esp_wifi_scan_get_ap_records(&ap_num, ap_records);
+    if (esp_wifi_scan_get_ap_num(&ap_num) != ESP_OK) {
+        ap_num = 0;
+    }
+    std::vector<wifi_ap_record_t> ap_records(ap_num);
+    if (ap_num > 0 && esp_wifi_scan_get_ap_records(&ap_num, ap_records.data()) != ESP_OK) {
+        ap_records.clear();
+        ap_num = 0;
+    }
     // sort by rssi descending
-    std::sort(ap_records, ap_records + ap_num, [](const wifi_ap_record_t& a, const wifi_ap_record_t& b) {
+    std::sort(ap_records.begin(), ap_records.end(), [](const wifi_ap_record_t& a, const wifi_ap_record_t& b) {
         return a.rssi > b.rssi;
     });
 
+    std::vector<WifiAccessPoint> access_points;
+    for (const wifi_ap_record_t& ap_record : ap_records) {
+        const char* ssid = reinterpret_cast<const char*>(ap_record.ssid);
+        const std::string name(ssid, strnlen(ssid, sizeof(ap_record.ssid)));
+        if (name.empty() || std::any_of(access_points.begin(), access_points.end(),
+                                        [&name](const WifiAccessPoint& item) {
+                                            return item.ssid == name;
+                                        })) {
+            continue;
+        }
+        access_points.push_back({name, ap_record.rssi, ap_record.authmode});
+    }
+    {
+        std::lock_guard<std::mutex> lock(access_points_mutex_);
+        access_points_ = access_points;
+    }
+    if (on_scan_completed_) {
+        on_scan_completed_(access_points);
+    }
+    if (!connect_after_scan) {
+        return;
+    }
+
     auto& ssid_manager = SsidManager::GetInstance();
     auto ssid_list = ssid_manager.GetSsidList();
-    for (int i = 0; i < ap_num; i++) {
-        auto ap_record = ap_records[i];
+    connect_queue_.clear();
+    for (const wifi_ap_record_t& ap_record : ap_records) {
         auto it = std::find_if(ssid_list.begin(), ssid_list.end(), [ap_record](const SsidItem& item) {
             return strcmp((char *)ap_record.ssid, item.ssid.c_str()) == 0;
         });
@@ -215,12 +313,10 @@ void WifiStation::HandleScanResult() {
             connect_queue_.push_back(record);
         }
     }
-    free(ap_records);
 
     if (connect_queue_.empty()) {
         ESP_LOGI(TAG, "No AP found, next scan in %d seconds", scan_current_interval_microseconds_ / 1000 / 1000);
-        esp_timer_start_once(timer_handle_, scan_current_interval_microseconds_);
-        UpdateScanInterval();
+        ScheduleNextScan();
         return;
     }
 
@@ -351,10 +447,7 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
                 this_->on_connect_(this_->ssid_);
             }
         } else {
-            esp_wifi_scan_start(nullptr, false);
-            if (this_->on_scan_begin_) {
-                this_->on_scan_begin_();
-            }
+            this_->StartScan(true, true);
         }
     } else if (event_id == WIFI_EVENT_SCAN_DONE) {
         xEventGroupSetBits(this_->event_group_, WIFI_EVENT_SCAN_DONE_BIT);
@@ -370,10 +463,13 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
             this_->on_disconnected_();
         }
         
-        if (this_->reconnect_count_ < MAX_RECONNECT_COUNT) {
+        if (this_->reconnect_count_ < this_->max_reconnect_count_) {
+            if (this_->on_connect_) {
+                this_->on_connect_(this_->ssid_);
+            }
             esp_wifi_connect();
             this_->reconnect_count_++;
-            ESP_LOGI(TAG, "Reconnecting %s (attempt %d / %d)", this_->ssid_.c_str(), this_->reconnect_count_, MAX_RECONNECT_COUNT);
+            ESP_LOGI(TAG, "Reconnecting %s (attempt %d / %d)", this_->ssid_.c_str(), this_->reconnect_count_, this_->max_reconnect_count_);
             return;
         }
 
@@ -381,11 +477,31 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
             this_->StartConnect();
             return;
         }
-        
-        ESP_LOGI(TAG, "No more AP to connect, next scan in %d seconds", 
+
+        if (this_->direct_mode_) {
+            if (!this_->scan_fallback_enabled_) {
+                if (this_->on_connection_failed_) {
+                    this_->on_connection_failed_();
+                }
+                return;
+            }
+            this_->direct_mode_ = false;
+            this_->reconnect_count_ = 0;
+            this_->immediate_scan_fallback_.store(false);
+            ESP_LOGI(TAG, "Direct connection failed, scanning saved networks");
+            this_->StartScan(true, true);
+            return;
+        }
+
+        if (this_->immediate_scan_fallback_.exchange(false)) {
+            ESP_LOGI(TAG, "Reconnect failed, scanning saved networks");
+            this_->StartScan(true, true);
+            return;
+        }
+
+        ESP_LOGI(TAG, "No saved AP found, retry scan in %d seconds",
                  this_->scan_current_interval_microseconds_ / 1000 / 1000);
-        esp_timer_start_once(this_->timer_handle_, this_->scan_current_interval_microseconds_);
-        this_->UpdateScanInterval();
+        this_->ScheduleNextScan();
     } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
     }
 }
@@ -404,6 +520,19 @@ void WifiStation::IpEventHandler(void* arg, esp_event_base_t event_base, int32_t
     if (this_->on_connected_) {
         this_->on_connected_(this_->ssid_);
     }
+    const std::vector<SsidItem> saved_networks = SsidManager::GetInstance().GetSsidList();
+    const auto saved_network = std::find_if(saved_networks.begin(), saved_networks.end(),
+                                            [this_](const SsidItem& item) {
+                                                return item.ssid == this_->ssid_;
+                                            });
+    if (saved_network != saved_networks.end()) {
+        SsidManager::GetInstance().SetDefaultSsid(
+            static_cast<int>(std::distance(saved_networks.begin(), saved_network)));
+    }
+    // Future disconnects start with a direct retry, then scan every saved network if needed.
+    this_->direct_mode_ = false;
+    this_->scan_fallback_enabled_ = true;
+    this_->immediate_scan_fallback_.store(true);
     this_->connect_queue_.clear();
     this_->reconnect_count_ = 0;
     

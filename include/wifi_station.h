@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <atomic>
+#include <mutex>
 
 #include <esp_event.h>
 #include <esp_timer.h>
@@ -23,6 +25,12 @@ struct WifiApRecord {
     int channel;
     wifi_auth_mode_t authmode;
     uint8_t bssid[6];
+};
+
+struct WifiAccessPoint {
+    std::string ssid;
+    int rssi;
+    wifi_auth_mode_t authmode;
 };
 
 /**
@@ -51,6 +59,8 @@ public:
      */
     void StartWithoutScan(const std::string& ssid, const std::string& password);
     void Stop();
+    bool ScanAccessPoints();
+    std::vector<WifiAccessPoint> GetAccessPoints() const;
     bool IsConnected();
     bool WaitForConnected(int timeout_ms = 10000);
     int8_t GetRssi();
@@ -63,6 +73,8 @@ public:
     void OnConnected(std::function<void(const std::string& ssid)> on_connected);
     void OnDisconnected(std::function<void()> on_disconnected);
     void OnScanBegin(std::function<void()> on_scan_begin);
+    void OnScanCompleted(std::function<void(const std::vector<WifiAccessPoint>&)> on_scan_completed);
+    void OnConnectionFailed(std::function<void()> on_connection_failed);
     void SetScanIntervalRange(int min_interval_seconds, int max_interval_seconds);
 
 private:
@@ -77,6 +89,8 @@ private:
     int8_t max_tx_power_;
     uint8_t remember_bssid_;
     int reconnect_count_ = 0;
+    int max_reconnect_count_ = 1;
+    bool scan_fallback_enabled_ = true;
     
     // Exponential backoff for scan interval
     int scan_min_interval_microseconds_ = 10 * 1000 * 1000;   // Default 10 seconds
@@ -86,15 +100,24 @@ private:
     std::function<void(const std::string& ssid)> on_connected_;
     std::function<void()> on_disconnected_;
     std::function<void()> on_scan_begin_;
+    std::function<void(const std::vector<WifiAccessPoint>&)> on_scan_completed_;
+    std::function<void()> on_connection_failed_;
     std::vector<WifiApRecord> connect_queue_;
+    mutable std::mutex access_points_mutex_;
+    std::vector<WifiAccessPoint> access_points_;
     bool was_connected_ = false;  // Track if we were connected before disconnection
+    std::atomic<bool> connect_after_scan_{false};
+    std::atomic<bool> scan_in_progress_{false};
+    std::atomic<bool> immediate_scan_fallback_{false};
 
-    // 直连模式标志：为 true 时不主动执行扫描，而是根据指定的 SSID/密码直接连接
+    // Direct mode is used for an explicit credential attempt before any scan fallback.
     bool direct_mode_ = false;
 
     // 根据 direct_mode_ 启动 STA，封装公共初始化逻辑
     void StartInternal();
 
+    bool StartScan(bool connect_after_scan, bool notify_started);
+    void ScheduleNextScan();
     void HandleScanResult();
     void StartConnect();
     void UpdateScanInterval();  // Exponential backoff for scan interval
