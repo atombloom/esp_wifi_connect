@@ -119,6 +119,11 @@ void WifiStation::OnConnectionFailed(std::function<void()> on_connection_failed)
     on_connection_failed_ = std::move(on_connection_failed);
 }
 
+void WifiStation::OnAutoConnectionExhausted(
+    std::function<void()> on_auto_connection_exhausted) {
+    on_auto_connection_exhausted_ = std::move(on_auto_connection_exhausted);
+}
+
 void WifiStation::OnConnect(std::function<void(const std::string& ssid)> on_connect) {
     on_connect_ = on_connect;
 }
@@ -175,6 +180,7 @@ void WifiStation::StartInternal() {
     // Clear stopped event bit so WaitForConnected works properly
     // Clear scan done bit so Stop() can wait for scan to complete
     xEventGroupClearBits(event_group_, WIFI_EVENT_STOPPED | WIFI_EVENT_SCAN_DONE_BIT);
+    scan_attempt_count_ = 0;
     
     // Create the default WiFi station interface
     station_netif_ = esp_netif_create_default_wifi_sta();
@@ -223,6 +229,9 @@ bool WifiStation::StartScan(bool connect_after_scan, bool notify_started) {
         ESP_LOGW(TAG, "Start scan failed: %s", esp_err_to_name(result));
         return false;
     }
+    if (connect_after_scan) {
+        ++scan_attempt_count_;
+    }
     if (notify_started && on_scan_begin_) {
         on_scan_begin_();
     }
@@ -233,6 +242,16 @@ void WifiStation::ScheduleNextScan() {
     if (timer_handle_ == nullptr) {
         return;
     }
+    if (scan_attempt_count_ >= scan_max_attempts_) {
+        ESP_LOGW(TAG, "Automatic scan exhausted after %d attempts", scan_attempt_count_);
+        if (on_auto_connection_exhausted_) {
+            on_auto_connection_exhausted_();
+        }
+        return;
+    }
+    ESP_LOGI(TAG, "Next automatic scan in %d seconds (%d / %d)",
+             scan_current_interval_microseconds_ / 1000 / 1000,
+             scan_attempt_count_ + 1, scan_max_attempts_);
     const esp_err_t result = esp_timer_start_once(timer_handle_, scan_current_interval_microseconds_);
     if (result != ESP_OK) {
         ESP_LOGW(TAG, "Schedule scan failed: %s", esp_err_to_name(result));
@@ -315,7 +334,6 @@ void WifiStation::HandleScanResult() {
     }
 
     if (connect_queue_.empty()) {
-        ESP_LOGI(TAG, "No AP found, next scan in %d seconds", scan_current_interval_microseconds_ / 1000 / 1000);
         ScheduleNextScan();
         return;
     }
@@ -389,6 +407,10 @@ void WifiStation::SetScanIntervalRange(int min_interval_seconds, int max_interva
     scan_min_interval_microseconds_ = min_interval_seconds * 1000 * 1000;
     scan_max_interval_microseconds_ = max_interval_seconds * 1000 * 1000;
     scan_current_interval_microseconds_ = scan_min_interval_microseconds_;
+}
+
+void WifiStation::SetMaxScanAttempts(int max_attempts) {
+    scan_max_attempts_ = std::max(1, max_attempts);
 }
 
 void WifiStation::SetPowerSaveLevel(WifiPowerSaveLevel level) {
@@ -499,8 +521,6 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
             return;
         }
 
-        ESP_LOGI(TAG, "No saved AP found, retry scan in %d seconds",
-                 this_->scan_current_interval_microseconds_ / 1000 / 1000);
         this_->ScheduleNextScan();
     } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
     }
@@ -538,4 +558,5 @@ void WifiStation::IpEventHandler(void* arg, esp_event_base_t event_base, int32_t
     
     // Reset scan interval to minimum for fast reconnect if disconnected later
     this_->scan_current_interval_microseconds_ = this_->scan_min_interval_microseconds_;
+    this_->scan_attempt_count_ = 0;
 }

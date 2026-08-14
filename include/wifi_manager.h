@@ -41,6 +41,7 @@ enum class WifiEvent {
     Disconnected,      // Disconnected from network
     ScanCompleted,     // Access-point list is ready
     ConnectionFailed,  // A direct connection exhausted its retries
+    AutoConnectionExhausted, // Automatic connection and finite scans found no saved AP
     ConfigModeEnter,   // Entered config AP mode
     ConfigModeExit,    // Exited config AP mode
 };
@@ -50,9 +51,10 @@ struct WifiManagerConfig {
     std::string ssid_prefix = "ESP32";    // AP mode SSID prefix
     std::string language = "zh-CN";       // Web UI language
     
-    // Station mode scan interval with exponential backoff
-    int station_scan_min_interval_seconds = 10;   // Initial scan interval (fast retry)
-    int station_scan_max_interval_seconds = 300;  // Maximum scan interval (5 minutes)
+    // Station mode automatic scan retry policy
+    int station_scan_min_interval_seconds = 3;
+    int station_scan_max_interval_seconds = 3;
+    int station_scan_max_attempts = 3;
 };
 
 /**

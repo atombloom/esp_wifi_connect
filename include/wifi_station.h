@@ -75,7 +75,9 @@ public:
     void OnScanBegin(std::function<void()> on_scan_begin);
     void OnScanCompleted(std::function<void(const std::vector<WifiAccessPoint>&)> on_scan_completed);
     void OnConnectionFailed(std::function<void()> on_connection_failed);
+    void OnAutoConnectionExhausted(std::function<void()> on_auto_connection_exhausted);
     void SetScanIntervalRange(int min_interval_seconds, int max_interval_seconds);
+    void SetMaxScanAttempts(int max_attempts);
 
 private:
     EventGroupHandle_t event_group_;
@@ -93,15 +95,18 @@ private:
     bool scan_fallback_enabled_ = true;
     
     // Exponential backoff for scan interval
-    int scan_min_interval_microseconds_ = 10 * 1000 * 1000;   // Default 10 seconds
-    int scan_max_interval_microseconds_ = 300 * 1000 * 1000;  // Default 5 minutes
-    int scan_current_interval_microseconds_ = 10 * 1000 * 1000;  // Current interval
+    int scan_min_interval_microseconds_ = 3 * 1000 * 1000;
+    int scan_max_interval_microseconds_ = 3 * 1000 * 1000;
+    int scan_current_interval_microseconds_ = 3 * 1000 * 1000;
+    int scan_max_attempts_ = 3;
+    int scan_attempt_count_ = 0;
     std::function<void(const std::string& ssid)> on_connect_;
     std::function<void(const std::string& ssid)> on_connected_;
     std::function<void()> on_disconnected_;
     std::function<void()> on_scan_begin_;
     std::function<void(const std::vector<WifiAccessPoint>&)> on_scan_completed_;
     std::function<void()> on_connection_failed_;
+    std::function<void()> on_auto_connection_exhausted_;
     std::vector<WifiApRecord> connect_queue_;
     mutable std::mutex access_points_mutex_;
     std::vector<WifiAccessPoint> access_points_;

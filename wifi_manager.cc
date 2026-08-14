@@ -141,6 +141,7 @@ void WifiManager::StartStation() {
     // Apply configuration
     station_->SetScanIntervalRange(config_.station_scan_min_interval_seconds,
                                    config_.station_scan_max_interval_seconds);
+    station_->SetMaxScanAttempts(config_.station_scan_max_attempts);
 
     ConfigureStationCallbacks();
 
@@ -181,6 +182,7 @@ void WifiManager::StartStationWithCredentials(const std::string& ssid,
     // Apply configuration
     station_->SetScanIntervalRange(config_.station_scan_min_interval_seconds,
                                    config_.station_scan_max_interval_seconds);
+    station_->SetMaxScanAttempts(config_.station_scan_max_attempts);
 
     ConfigureStationCallbacks();
 
@@ -380,6 +382,9 @@ void WifiManager::ConfigureStationCallbacks() {
     });
     station_->OnConnectionFailed([this]() {
         NotifyEvent(WifiEvent::ConnectionFailed);
+    });
+    station_->OnAutoConnectionExhausted([this]() {
+        NotifyEvent(WifiEvent::AutoConnectionExhausted);
     });
 }
 
